@@ -3,7 +3,7 @@
  *
  * A long-running process on the user's machine (laptop or VPS) that hosts one
  * or more of their Cumora agents, using a local engine (Claude Code / Codex /
- * Grok Build / Cursor Agent) as each agent's brain. See docs/BYOA.md.
+ * Grok Build / Cursor Agent / OpenCode) as each agent's brain. See docs/BYOA.md.
  *
  * It talks to the Cumora server only over HTTP — no DB/Redis — so it can run
  * anywhere:
@@ -627,6 +627,9 @@ function authFailureHint(engine: EngineId, detail: string): string {
   if (engine === 'cursor') {
     return 'Open a terminal on that computer and run `cursor-agent login` (or fix its quota / API key), then wake the agent again.'
   }
+  if (engine === 'opencode') {
+    return 'Open a terminal on that computer and run `opencode providers login` (or fix the selected provider/model quota), then wake the agent again.'
+  }
   return 'Open Codex on that computer and refresh its login or quota, then wake the agent again.'
 }
 
@@ -639,6 +642,7 @@ function missingEngineMessage(): string {
     '  - Codex: install the `codex` CLI, then run `codex` once to sign in',
     '  - Grok Build: install the `grok` CLI, then run `grok login` once',
     '  - Cursor Agent: install Cursor (the `cursor-agent` CLI ships with it), then run `cursor-agent login`',
+    '  - OpenCode: install the `opencode` CLI, then run `opencode providers login` once',
     '',
     'After that, rerun:',
     '  npx cumora@latest agent computer --pair <code>',
@@ -650,7 +654,7 @@ function helpText(): string {
     'cumora agent computer — run your Cumora agents on THIS machine (BYOA)',
     '',
     'The daemon talks to a Cumora server over HTTP and drives a local agent',
-    'engine (Claude Code, Codex, Grok Build, or Cursor Agent). Pair once, then it runs in the background.',
+    'engine (Claude Code, Codex, Grok Build, Cursor Agent, or OpenCode). Pair once, then it runs in the background.',
     '',
     'Usage:',
     '  npx cumora@latest agent computer --pair <code> [--server <url>] [--engine <id>]',
@@ -1062,16 +1066,15 @@ class AgentRunner {
     return this.hopReporter
   }
 
-  /** Map an engine's raw EngineUsage → universal TokenUsage. Both Claude and
-   *  Codex (which adapters their codex.totals into Claude-shaped fields, see
-   *  CodexSession.turnUsage) report via the EngineUsage interface, so a single
-   *  shape covers both. */
+  /** Map every adapter's raw EngineUsage → universal TokenUsage. Adapters
+   *  normalize their native counters into this Claude-shaped interface, so a
+   *  single ledger path covers every BYOA engine. */
   private hopUsageOf(u: EngineUsage): TokenUsage {
     return usageFromClaude(u as unknown as Record<string, unknown>)
   }
 
-  /** Called by ClaudeSession / CodexSession for every assistant hop (Claude)
-   *  or every turn-completed (Codex). Pushes one PendingHop into the batched
+  /** Called by engine sessions/stream trackers for every provider hop. Pushes
+   *  one PendingHop into the batched
    *  reporter; never throws. The engine's optional enrichment hints
    *  (hopIndex/toolUses/textChars) ride along in `extras` — these are exactly
    *  the columns the operator needs to ANSWER "why was this hop expensive?"
@@ -1263,8 +1266,8 @@ class AgentRunner {
 
   /** The long-lived engine process for this agent (persistent stream-json),
    *  created lazily and reused across wakes so turns 2..N skip the cold start.
-   *  Returns null if the engine has no persistent mode (Cursor, Codex fallback,
-   *  or a custom args override) — the caller then uses one-shot run(). If the
+   *  Returns null if the engine has no persistent mode (Cursor/OpenCode, Codex
+   *  fallback, or custom args) — the caller then uses one-shot run(). If the
    *  prior process has died it respawns, resuming this.sessionId so context
    *  carries across the restart. */
   private ensureEngineSession(): EngineSession | null {
@@ -1455,7 +1458,8 @@ class AgentRunner {
       const verdict = finalizeTriage(parsed, 'support-model-local')
       // Record the gate's cache-aware cost (fire-and-forget). A BYOA triage runs
       // LOCAL + cold-session — its input is uncached, the cost this ledger exists
-      // to weigh. usage is present for Claude and Cursor; absent for Codex/Grok.
+      // to weigh. usage is present for Claude, Cursor, and OpenCode; absent for
+      // the current Codex/Grok one-shot classifiers.
       void this.recordTriageUsage(token, verdict.actionable, verdict.reason, res.usage, res.model)
       return verdict
     }
@@ -1477,14 +1481,15 @@ class AgentRunner {
     }
   }
 
-  /** Triage model id for pricing, honoring CUMORA_TRIAGE_MODEL. Cursor has
-   *  no fixed cheap alias, so its reported stream model wins; the agent model
-   *  is only a fallback when the stream does not name one. */
+  /** Triage model id for pricing, honoring CUMORA_TRIAGE_MODEL. Cursor and
+   *  OpenCode have no universal cheap alias, so a reported/pinned stream model
+   *  wins and the agent model is only a fallback. */
   private triageModel(): string {
     if (process.env.CUMORA_TRIAGE_MODEL) return process.env.CUMORA_TRIAGE_MODEL
     if (this.adapter.id === 'claude') return 'haiku'
     if (this.adapter.id === 'grok') return 'grok-4.5'
     if (this.adapter.id === 'codex') return 'gpt-5.4-mini'
+    if (this.adapter.id === 'opencode') return this.agent.model ?? '<opencode-default>'
     return this.agent.model ?? '<cursor-default>'
   }
 
@@ -2167,7 +2172,7 @@ class AgentRunner {
             // (with --resume this.sessionId to carry context across the restart).
             if (!session.alive) this.engineSession = null
           } else {
-            // One-shot path: Cursor, Codex fallback, or a custom args override.
+            // One-shot path: Cursor/OpenCode, Codex fallback, or a custom args override.
             result = await this.adapter.run({
               home: this.home,
               prompt,

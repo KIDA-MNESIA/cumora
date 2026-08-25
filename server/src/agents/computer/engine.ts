@@ -2,7 +2,8 @@
  * EngineAdapter — the pluggable "brain" for a BYOA agent.
  *
  * A BYOA agent's reasoning loop is delegated to a local CLI engine running
- * on the user's machine: Claude Code, Codex, Grok Build, or Cursor Agent. The daemon (daemon.ts) hands
+ * on the user's machine: Claude Code, Codex, Grok Build, Cursor Agent, or
+ * OpenCode. The daemon (daemon.ts) hands
  * each wake to an adapter, which spawns the engine headlessly in the agent's
  * isolated home directory. The engine reads its persona + memory + skills
  * from that home natively (CLAUDE.md / AGENTS.md, .claude/skills, …) and acts
@@ -15,7 +16,7 @@
  * across engine versions. We pick sensible defaults for an isolated,
  * user-owned runner and let the user override via env
  * (CUMORA_CLAUDE_ARGS / CUMORA_CODEX_ARGS / CUMORA_GROK_ARGS /
- *  CUMORA_CURSOR_ARGS, space-split). Correctness of the
+ *  CUMORA_CURSOR_ARGS / CUMORA_OPENCODE_ARGS, space-split). Correctness of the
  * loop does not depend on the structured output — the agent acts via the
  * `cumora` tool regardless of how we parse stdout.
  */
@@ -86,10 +87,10 @@ export function resolveSpawn(bin: string): { command: string; shell: boolean; wa
   return { command: bin, shell: true, wantsStdinPrompt: true }
 }
 
-export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor'
+export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode']
 
 export interface EnginePersona {
   id: string
@@ -2263,11 +2264,409 @@ class CursorAdapter implements EngineAdapter {
   // the session id it reports (see the section note).
 }
 
+// ─── opencode ────────────────────────────────────────────────────────────
+//
+// OpenCode (the `opencode` CLI, contract verified against v1.18.20) is a
+// ONE-SHOT engine in Cumora. `opencode run --format json` starts a process for
+// one wake and emits JSONL events; continuity comes from passing the emitted
+// `sessionID` back through `--session <id>` on the next wake. OpenCode has an
+// ACP server, but that protocol is intended for editor clients and does not buy
+// us the daemon's standing-prompt/session semantics, so the supported path is
+// the documented `run` interface.
+//
+//   opencode run --format json --auto [--model provider/model]
+//     [--session <id>]                 # prompt always travels via stdin
+//
+// A `step_finish` event is one provider hop. Its token fields are already
+// disjoint (uncached input, output, reasoning, cache read/write), so the
+// adapter can report honest per-hop ledger rows and sum them for the turn.
+// OpenCode's event loop can race the terminal `session.status=idle` event and
+// omit the final step_finish even after a successful run, so process exit 0 is
+// authoritative; accounting is best-effort rather than a completion gate.
+// OpenCode's JSON stream does not currently include the resolved model when no
+// pin is supplied; in that case the hop uses the explicit `opencode` fallback
+// label rather than inventing a provider/model id.
+//
+// Full turns use `--auto` because the daemon is headless and the agent's home is
+// operator-owned. Triage/doctor deliberately do NOT: they select an injected
+// `cumora-triage` agent whose wildcard permission is `deny`, giving the small
+// brain a hard, tool-free boundary even if the user's normal OpenCode agent is
+// configured to allow shell or edits.
+
+interface OpenCodeTokens {
+  input?: unknown
+  output?: unknown
+  reasoning?: unknown
+  cache?: { read?: unknown; write?: unknown }
+}
+
+interface OpenCodePart {
+  type?: unknown
+  text?: unknown
+  tokens?: OpenCodeTokens
+}
+
+interface OpenCodeEvent {
+  type?: unknown
+  sessionID?: unknown
+  part?: OpenCodePart
+  error?: unknown
+}
+
+function openCodeUsage(tokens: OpenCodeTokens | undefined): EngineUsage | undefined {
+  if (!tokens || typeof tokens !== 'object') return undefined
+  const num = (value: unknown): number =>
+    typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0
+  return {
+    input_tokens: num(tokens.input),
+    // OpenCode keeps reasoning separate from ordinary output; Cumora's common
+    // usage shape prices both as output tokens, so fold them together here.
+    output_tokens: num(tokens.output) + num(tokens.reasoning),
+    cache_read_input_tokens: num(tokens.cache?.read),
+    cache_creation_input_tokens: num(tokens.cache?.write),
+  }
+}
+
+function addEngineUsage(total: EngineUsage | undefined, next: EngineUsage): EngineUsage {
+  return {
+    input_tokens: (total?.input_tokens ?? 0) + (next.input_tokens ?? 0),
+    output_tokens: (total?.output_tokens ?? 0) + (next.output_tokens ?? 0),
+    cache_read_input_tokens: (total?.cache_read_input_tokens ?? 0) + (next.cache_read_input_tokens ?? 0),
+    cache_creation_input_tokens: (total?.cache_creation_input_tokens ?? 0) + (next.cache_creation_input_tokens ?? 0),
+  }
+}
+
+function objectRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function openCodeErrorText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (!objectRecord(value)) return value == null ? 'unknown OpenCode error' : String(value)
+  const data = objectRecord(value.data) ? value.data : null
+  for (const candidate of [data?.message, value.message, value.name]) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
+  }
+  try { return JSON.stringify(value) } catch { return 'unknown OpenCode error' }
+}
+
+/** Fold OpenCode's JSONL into the common turn/result shape. */
+class OpenCodeTurnTracker {
+  sessionId: string | null = null
+  model: string | null
+  usage: EngineUsage | undefined
+  text = ''
+  error: string | null = null
+  private hopStartedAt: number | null = null
+  private hopIndex = 0
+  private hopTextChars = 0
+  private hopToolUses = 0
+
+  constructor(
+    pin: string | null,
+    private readonly onHopUsage?: (report: EngineHopReport) => void,
+  ) {
+    this.model = pin
+  }
+
+  observe(event: OpenCodeEvent): void {
+    if (typeof event.sessionID === 'string' && event.sessionID) this.sessionId = event.sessionID
+
+    if (event.type === 'error') {
+      this.error = openCodeErrorText(event.error)
+      return
+    }
+
+    if (event.type === 'step_start') {
+      this.hopStartedAt = Date.now()
+      this.hopTextChars = 0
+      this.hopToolUses = 0
+      return
+    }
+
+    if (event.type === 'text' && typeof event.part?.text === 'string') {
+      this.text += event.part.text
+      this.hopTextChars += event.part.text.length
+      return
+    }
+
+    if (event.type === 'tool_use') {
+      this.hopToolUses += 1
+      return
+    }
+
+    if (event.type !== 'step_finish') return
+    const hopUsage = openCodeUsage(event.part?.tokens)
+    if (!hopUsage) return
+    this.usage = addEngineUsage(this.usage, hopUsage)
+    this.hopIndex += 1
+    if (this.onHopUsage) {
+      try {
+        this.onHopUsage({
+          model: this.model ?? 'opencode',
+          usage: hopUsage,
+          latencyMs: this.hopStartedAt == null ? undefined : Date.now() - this.hopStartedAt,
+          hopIndex: this.hopIndex,
+          toolUses: this.hopToolUses,
+          textChars: this.hopTextChars,
+        })
+      } catch { /* ledger reporting is best-effort */ }
+    }
+    this.hopStartedAt = null
+    this.hopTextChars = 0
+    this.hopToolUses = 0
+  }
+}
+
+function parseOpenCodeLine(line: string): OpenCodeEvent | null {
+  if (!line.startsWith('{')) return null
+  try { return JSON.parse(line) as OpenCodeEvent } catch { return null }
+}
+
+/** Reuse the battle-tested one-shot process pump (UTF-8/chunk boundaries,
+ * abort handling, bounded failure tails) while folding each complete stdout
+ * line through the OpenCode tracker. */
+async function spawnOpenCodeStream(
+  command: string,
+  argv: string[],
+  opts: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    prompt: string
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    shell: boolean
+    onHopUsage?: (report: EngineHopReport) => void
+    pin?: string | null
+  },
+): Promise<EngineRunResult & { text: string }> {
+  const tracker = new OpenCodeTurnTracker(opts.pin ?? null, opts.onHopUsage)
+  let processResult: EngineRunResult
+  try {
+    processResult = await spawnEngine(
+      command,
+      argv,
+      {
+        home: opts.cwd,
+        prompt: opts.prompt,
+        env: opts.env,
+        onLog: (line) => {
+          const event = parseOpenCodeLine(line)
+          if (event) tracker.observe(event)
+          opts.onLog?.(line)
+        },
+        signal: opts.signal,
+      },
+      { shell: opts.shell, stdinText: opts.prompt },
+    )
+  } catch (err) {
+    return {
+      exitCode: 1,
+      error: err instanceof Error ? err.message : String(err),
+      sessionId: tracker.sessionId,
+      usage: tracker.usage,
+      model: tracker.model,
+      text: tracker.text,
+    }
+  }
+
+  const eventError = tracker.error
+    ? `engine turn error: ${tracker.error.slice(0, MAX_FAILURE_CHARS)}`
+    : null
+  const streamError = eventError
+  const exitCode = processResult.exitCode !== 0 ? processResult.exitCode : (streamError ? 1 : 0)
+  return {
+    exitCode,
+    // A real process failure (auth, quota, bad flag, abort) is more useful than
+    // the secondary fact that its stream never reached step_finish. Promote a
+    // stream-only error only when the process itself exited cleanly. If the
+    // JSON stream also carried a provider error, append its decoded prose so
+    // stale-session/rate-limit recovery can match it without parsing JSON.
+    error: processResult.exitCode !== 0
+      ? [processResult.error, eventError].filter(Boolean).join('\n')
+      : (streamError ?? undefined),
+    sessionId: tracker.sessionId,
+    usage: tracker.usage,
+    model: tracker.model,
+    text: tracker.text,
+  }
+}
+
+const OPENCODE_TRIAGE_AGENT = 'cumora-triage'
+
+/** Inject a reserved, tool-free agent as the final inline config layer while
+ * preserving any provider/plugin config the operator already supplied there. */
+function openCodeTriageEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  let inline: Record<string, unknown> = {}
+  const raw = env.OPENCODE_CONFIG_CONTENT?.trim()
+  if (raw) {
+    let parsed: unknown
+    try { parsed = JSON.parse(raw) }
+    catch (err) {
+      throw new Error(`OPENCODE_CONFIG_CONTENT is not valid JSON: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    if (!objectRecord(parsed)) throw new Error('OPENCODE_CONFIG_CONTENT must be a JSON object')
+    inline = parsed
+  }
+  const agents = objectRecord(inline.agent) ? inline.agent : {}
+  return {
+    ...env,
+    OPENCODE_CONFIG_CONTENT: JSON.stringify({
+      ...inline,
+      agent: {
+        ...agents,
+        [OPENCODE_TRIAGE_AGENT]: {
+          description: 'Cumora local small-brain classifier (tool-free)',
+          mode: 'primary',
+          prompt: 'Answer the user directly. Do not call tools or modify anything.',
+          permission: { '*': 'deny' },
+        },
+      },
+    }),
+  }
+}
+
+class OpenCodeAdapter implements EngineAdapter {
+  readonly id = 'opencode' as const
+  readonly bin = 'opencode'
+
+  private turn(prompt: string, args: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    model?: string | null
+    resumeSessionId?: string | null
+    onHopUsage?: (report: EngineHopReport) => void
+  }): Promise<EngineRunResult & { text: string }> {
+    const { command, shell } = resolveSpawn(this.bin)
+    const model = args.model ? ['--model', args.model] : []
+    const resume = args.resumeSessionId ? ['--session', args.resumeSessionId] : []
+    return spawnOpenCodeStream(
+      command,
+      ['run', '--format', 'json', '--auto', ...resume, ...model],
+      {
+        cwd: args.cwd,
+        env: args.env,
+        prompt,
+        signal: args.signal,
+        onLog: args.onLog,
+        shell,
+        onHopUsage: args.onHopUsage,
+        pin: args.model ?? null,
+      },
+    )
+  }
+
+  private ask(prompt: string, args: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    model?: string | null
+  }): Promise<EngineRunResult & { text: string }> {
+    const { command, shell } = resolveSpawn(this.bin)
+    const model = args.model ? ['--model', args.model] : []
+    return spawnOpenCodeStream(
+      command,
+      ['run', '--format', 'json', '--agent', OPENCODE_TRIAGE_AGENT, ...model],
+      {
+        cwd: args.cwd,
+        env: openCodeTriageEnv(args.env),
+        prompt,
+        signal: args.signal,
+        onLog: args.onLog,
+        shell,
+        pin: args.model ?? null,
+      },
+    )
+  }
+
+  async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    const flags = extraArgs('CUMORA_TRIAGE_ARGS')
+    if (flags.length) {
+      // User-owned output flags remain an escape hatch, but the reserved agent
+      // is appended last so the triage process stays tool-free.
+      const { command, shell } = resolveSpawn(this.bin)
+      return spawnCapture(command, ['run', ...flags, '--agent', OPENCODE_TRIAGE_AGENT], {
+        cwd: args.cwd,
+        env: openCodeTriageEnv(args.env),
+        signal: args.signal,
+        onLog: args.onLog,
+        shell,
+        stdinText: args.prompt,
+      })
+    }
+    const result = await this.ask(args.prompt, {
+      cwd: args.cwd,
+      env: args.env,
+      signal: args.signal,
+      onLog: args.onLog,
+      model: args.model,
+    })
+    return { text: result.text, error: result.error, usage: result.usage, model: result.model }
+  }
+
+  async probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    // OpenCode has no universal cheap model alias: provider/model ids are
+    // operator-specific. The small tier honors CUMORA_TRIAGE_MODEL; otherwise
+    // both probes use the operator's configured default.
+    const model = args.tier === 'small' ? (process.env.CUMORA_TRIAGE_MODEL?.trim() || null) : null
+    const result = await this.ask(DOCTOR_PROMPT, {
+      cwd: args.cwd,
+      env: args.env,
+      signal: args.signal,
+      model,
+    })
+    return { text: result.text, error: result.error, usage: result.usage, model: result.model }
+  }
+
+  probeWake(_args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    // The real wake is the same one-shot `opencode run` shape probe() already
+    // exercises; --session only adds continuity, not a second protocol.
+    return Promise.resolve({ ok: true, detail: '', skipped: true })
+  }
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    await mkdir(join(home, '.opencode', 'skills'), { recursive: true })
+    await writeFile(
+      join(home, 'AGENTS.md'),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.opencode/skills/' }),
+      'utf8',
+    )
+  }
+
+  async run(args: EngineRunArgs): Promise<EngineRunResult> {
+    const flags = extraArgs('CUMORA_OPENCODE_ARGS')
+    if (flags.length) {
+      // Whole user-owned run-flag override: output becomes opaque, but preserve
+      // the session id and stdin prompt so continuity and Windows safety remain.
+      const resume = args.resumeSessionId ? ['--session', args.resumeSessionId] : []
+      const { command, shell } = resolveSpawn(this.bin)
+      return spawnEngine(command, ['run', ...flags, ...resume], args, { shell, stdinText: args.prompt })
+    }
+    return this.turn(args.prompt, {
+      cwd: args.home,
+      env: args.env,
+      signal: args.signal,
+      onLog: args.onLog,
+      model: args.model,
+      resumeSessionId: args.resumeSessionId,
+      onHopUsage: args.onHopUsage,
+    })
+  }
+
+  // No startSession: the documented headless contract is one `run` process per
+  // wake; --session re-opens the same conversation in that fresh process.
+}
+
 const ADAPTERS: Record<EngineId, EngineAdapter> = {
   claude: new ClaudeAdapter(),
   codex: new CodexAdapter(),
   grok: new GrokAdapter(),
   cursor: new CursorAdapter(),
+  opencode: new OpenCodeAdapter(),
 }
 
 export function getAdapter(id: EngineId): EngineAdapter {
@@ -2325,9 +2724,10 @@ export interface EngineHealth {
   big: BrainHealth | null
   small: BrainHealth | null
   /** Wake-path protocol health (codex app-server JSON-RPC handshake; claude
-   *  persistent-session flag set; grok ACP stdio handshake). Separate signal from big/small because the
-   *  failure modes are different — those are auth/quota; this is protocol/CLI
-   *  version compatibility. */
+   *  persistent-session flag set; grok ACP stdio handshake). Cursor/OpenCode
+   *  skip it because their wake path is the same one-shot call as the brain
+   *  probe. Separate signal from big/small because those failures are
+   *  auth/quota, while this one is protocol/CLI compatibility. */
   wake: WakeHealth | null
 }
 

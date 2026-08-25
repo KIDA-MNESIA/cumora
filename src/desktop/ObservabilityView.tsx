@@ -646,8 +646,8 @@ function PriceMenuTable({ rows }: { rows: { model: string; inPer1M: number; cach
   const t = useT()
   if (rows.length === 0) return null
   // Fixed cerebellum aliases: claude→haiku, codex→gpt-5.4-mini,
-  // grok→grok-4.5. Cursor has no fixed cheap alias and reports the model its
-  // account selected, so it is classified by that model id.
+  // grok→grok-4.5. Cursor/OpenCode have no fixed cheap alias and report the
+  // configured model, so they are classified by that model id.
   const isSmall = (m: string) => /haiku|mini|grok-4\.5/i.test(m)
   return (
     <div className="rounded-[10px] border border-ink-100 bg-paper px-3.5 py-3">
