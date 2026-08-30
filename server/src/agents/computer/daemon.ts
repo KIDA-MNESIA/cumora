@@ -966,7 +966,8 @@ export interface RuntimeCliBrokerResult {
 export class RuntimeCliBroker {
   private timer: ReturnType<typeof setInterval> | null = null
   private watcher: FSWatcher | null = null
-  private polling = false
+  private pollPromise: Promise<void> | null = null
+  private rerunRequested = false
   private stopped = false
   private abortController = new AbortController()
   private readonly requestsDir: string
@@ -982,6 +983,11 @@ export class RuntimeCliBroker {
   }
 
   async start(): Promise<void> {
+    // A stopped broker may be started again by a supervisor. Never clean or
+    // reuse its namespace while the previous drain is still unwinding.
+    if (this.pollPromise) await this.pollPromise.catch(() => {})
+    this.pollPromise = null
+    this.rerunRequested = false
     await mkdir(this.requestsDir, { recursive: true })
     await mkdir(this.responsesDir, { recursive: true })
     await mkdir(this.processingDir, { recursive: true })
@@ -997,18 +1003,23 @@ export class RuntimeCliBroker {
     // computer hosts many agents. A slow fallback poll covers dropped watcher
     // events and filesystems where fs.watch is unavailable or unreliable.
     try {
-      this.watcher = watch(this.requestsDir, { persistent: false }, () => { void this.poll() })
+      this.watcher = watch(this.requestsDir, { persistent: false }, () => {
+        void this.poll().catch((err) => this.logPollFailure(err))
+      })
       this.watcher.on('error', () => {
         this.watcher?.close()
         this.watcher = null
       })
     } catch { this.watcher = null }
-    this.timer = setInterval(() => { void this.poll() }, CLI_IPC_FALLBACK_POLL_MS)
+    this.timer = setInterval(() => {
+      void this.poll().catch((err) => this.logPollFailure(err))
+    }, CLI_IPC_FALLBACK_POLL_MS)
     this.timer.unref?.()
   }
 
   stop(): void {
     this.stopped = true
+    this.rerunRequested = false
     this.abortController.abort()
     if (this.timer) clearInterval(this.timer)
     this.timer = null
@@ -1017,19 +1028,43 @@ export class RuntimeCliBroker {
   }
 
   /** Immediate poll for deterministic tests; the normal runner uses the timer. */
-  async poll(): Promise<void> {
-    if (this.stopped || this.polling) return
-    this.polling = true
-    try {
+  poll(): Promise<void> {
+    if (this.stopped) return Promise.resolve()
+    // Coalesce an arbitrary watcher/timer storm into one pending rerun. Every
+    // caller shares the same drain promise, so an explicit await still covers a
+    // request that landed after the active pass took its readdir snapshot.
+    this.rerunRequested = true
+    if (!this.pollPromise) {
+      const drain = this.drainPolls()
+      this.pollPromise = drain
+      // Use both handlers instead of .finally(): ignoring the Promise returned
+      // by finally() would itself create an unhandled rejection on failure.
+      void drain.then(
+        () => { if (this.pollPromise === drain) this.pollPromise = null },
+        () => { if (this.pollPromise === drain) this.pollPromise = null },
+      )
+    }
+    return this.pollPromise
+  }
+
+  private async drainPolls(): Promise<void> {
+    while (!this.stopped && this.rerunRequested) {
+      this.rerunRequested = false
       const names = await readdir(this.requestsDir).catch(() => [] as string[])
       for (const name of names) {
         if (this.stopped || this.abortController.signal.aborted) break
         if (!/^[0-9a-f-]{36}\.json$/i.test(name)) continue
-        await this.handle(name)
+        try { await this.handle(name) }
+        catch (err) { this.logPollFailure(err, name) }
       }
-    } finally {
-      this.polling = false
     }
+  }
+
+  private logPollFailure(err: unknown, name?: string): void {
+    console.error(
+      `[runtime] CLI IPC broker${name ? ` request ${name}` : ''} failed`,
+      err instanceof Error ? err.message : String(err),
+    )
   }
 
   private async handle(name: string): Promise<void> {

@@ -256,6 +256,63 @@ test('the privileged IPC broker refuses model-created request symlinks', {
   assert.match(response.error ?? '', /regular file|symbolic link|too many levels/i)
 })
 
+test('the IPC broker coalesces a trigger storm while preserving one pending rerun', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cumora-ipc-coalesce-'))
+  cleanup.push(() => rm(dir, { recursive: true, force: true }))
+  const ipcDir = join(dir, 'ipc')
+  const calls: string[][] = []
+  let firstInvocationStarted!: () => void
+  const started = new Promise<void>((resolve) => { firstInvocationStarted = resolve })
+  let releaseFirstInvocation!: () => void
+  const blocked = new Promise<void>((resolve) => { releaseFirstInvocation = resolve })
+  const broker = new RuntimeCliBroker(ipcDir, join(dir, 'broker'), async (argv) => {
+    calls.push(argv)
+    if (calls.length === 1) {
+      firstInvocationStarted()
+      await blocked
+    }
+    return { text: 'ok', exitCode: 0 }
+  })
+  await broker.start()
+  cleanup.push(() => broker.stop())
+
+  const firstId = '12345678-1234-1234-1234-123456789abe'
+  await writeFile(join(ipcDir, 'requests', `${firstId}.json`), JSON.stringify({ argv: ['first'] }), 'utf8')
+  const activeDrain = broker.poll()
+  await started
+
+  const secondId = '12345678-1234-1234-1234-123456789abf'
+  await writeFile(join(ipcDir, 'requests', `${secondId}.json`), JSON.stringify({ argv: ['second'] }), 'utf8')
+  const storm = Array.from({ length: 2_000 }, () => broker.poll())
+  assert.ok(storm.every((pending) => pending === activeDrain), 'all triggers must share one bounded drain')
+
+  releaseFirstInvocation()
+  await Promise.all(storm)
+  assert.deepEqual(calls, [['first'], ['second']])
+})
+
+test('a response publication failure is logged inside the broker drain, not rejected in the background', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cumora-ipc-response-failure-'))
+  cleanup.push(() => rm(dir, { recursive: true, force: true }))
+  const ipcDir = join(dir, 'ipc')
+  let invoked = false
+  const broker = new RuntimeCliBroker(ipcDir, join(dir, 'broker'), async () => {
+    invoked = true
+    return { text: 'ok', exitCode: 0 }
+  })
+  await broker.start()
+  cleanup.push(() => broker.stop())
+
+  const id = '12345678-1234-1234-1234-123456789ac0'
+  const responsePath = join(ipcDir, 'responses', `${id}.json`)
+  await mkdir(responsePath)
+  await writeFile(join(ipcDir, 'requests', `${id}.json`), JSON.stringify({ argv: ['inbox'] }), 'utf8')
+
+  await assert.doesNotReject(broker.poll())
+  assert.equal(invoked, true)
+  assert.equal((await lstat(responsePath)).isDirectory(), true)
+})
+
 test('stopping the IPC broker aborts an in-flight daemon call and suppresses its response', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'cumora-ipc-stop-'))
   cleanup.push(() => rm(dir, { recursive: true, force: true }))
