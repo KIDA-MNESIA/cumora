@@ -19,7 +19,8 @@ import { InvalidModelIdError, parseModelId } from './model-id.js'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { pool } from '../../db/pool.js'
 import { audit } from '../../auth.js'
-import { CH_STATUS, publish } from '../../redis.js'
+import { CH_STATUS } from '../../redis.js'
+import { enqueueBroadcast, nudgeRealtimeOutbox } from '../../realtime-outbox.js'
 import { normalizeTier, type Tier } from '../../tier.js'
 import { signAgentToken } from '../runtime/jwt.js'
 import type { EngineModelCatalog, EngineModelOption, FastModelScope, ModelCatalogSource } from './model-catalog.js'
@@ -38,12 +39,15 @@ export const COMPUTER_STALE_MS = 90_000
 async function broadcastComputerStatus(
   computerId: string, companyId: string, status: ComputerStatus,
 ): Promise<void> {
-  await publish(CH_STATUS, { type: 'computers.status', computerId, status, companyId }).catch((error) => {
+  try {
+    await enqueueBroadcast(pool, CH_STATUS, { type: 'computers.status', computerId, status, companyId })
+    nudgeRealtimeOutbox()
+  } catch (error) {
     console.warn(
-      `[computer] durable ${computerId}=${status} update committed but publish failed`,
+      `[computer] durable ${computerId}=${status} update committed but outbox insert failed`,
       error,
     )
-  })
+  }
 }
 
 /** Announce a just-paired computer as online. Split out from {@link pairComputer}
