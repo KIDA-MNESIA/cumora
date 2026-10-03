@@ -6,8 +6,9 @@
  * than the retention window is completed with an error instead of being
  * retried forever. `realtime-outbox.ts` uses the same shape.
  *
- * `WORKSPACE_RUNTIME_CLEANUP_ENABLED=false` leaves jobs that still have
- * agent ids unclaimed. Turning the flag on later still runs them. Storage
+ * `WORKSPACE_RUNTIME_CLEANUP_ENABLED=false` releases a job that still needs
+ * its default runtime deleter without counting an attempt, so turning the
+ * flag on later still runs it. Storage
  * keys are matched exactly (`attachment->>'key'`, avatar URL parsing),
  * not by a leading-wildcard LIKE over `jsonb::text`.
  */
@@ -76,7 +77,6 @@ async function claimBatch(limit: number): Promise<CleanupJob[]> {
           AND (locked_until IS NULL OR locked_until < NOW())
           AND attempts < $4
           AND created_at > NOW() - ($5 * INTERVAL '1 day')
-          AND (cardinality(agent_ids) = 0 OR $6::boolean)
         ORDER BY created_at, id
         LIMIT $1
         FOR UPDATE SKIP LOCKED
@@ -88,7 +88,7 @@ async function claimBatch(limit: number): Promise<CleanupJob[]> {
        FROM candidates c
       WHERE j.id = c.id
       RETURNING j.id, j.agent_ids, j.storage_keys, j.attempts`,
-    [limit, workerId, CLAIM_LEASE_MS, CLEANUP_MAX_ATTEMPTS, CLEANUP_MAX_AGE_DAYS, env.WORKSPACE_RUNTIME_CLEANUP_ENABLED],
+    [limit, workerId, CLAIM_LEASE_MS, CLEANUP_MAX_ATTEMPTS, CLEANUP_MAX_AGE_DAYS],
   )
   return rows
 }
@@ -102,14 +102,8 @@ async function discardExpired(): Promise<number> {
             last_error = COALESCE(last_error, 'cleanup budget exhausted'),
             updated_at = NOW()
       WHERE completed_at IS NULL
-        AND (
-          attempts >= $1
-          OR (
-            created_at <= NOW() - ($2 * INTERVAL '1 day')
-            AND (cardinality(agent_ids) = 0 OR $3::boolean)
-          )
-        )`,
-    [CLEANUP_MAX_ATTEMPTS, CLEANUP_MAX_AGE_DAYS, env.WORKSPACE_RUNTIME_CLEANUP_ENABLED],
+        AND (attempts >= $1 OR created_at <= NOW() - ($2 * INTERVAL '1 day'))`,
+    [CLEANUP_MAX_ATTEMPTS, CLEANUP_MAX_AGE_DAYS],
   )
   const discarded = result.rowCount ?? 0
   if (discarded > 0) {
@@ -176,9 +170,11 @@ export async function findReferencedStorageKeys(keys: string[], client?: PoolCli
   return referenced
 }
 
+class CleanupDeferred extends Error {}
+
 async function defaultDeleteAgentRuntime(agentId: string): Promise<void> {
   if (!env.WORKSPACE_RUNTIME_CLEANUP_ENABLED) {
-    throw new Error('workspace runtime cleanup is disabled')
+    throw new CleanupDeferred('workspace runtime cleanup is disabled')
   }
   const { deletePod, deleteChromeProfilePvc } = await import('./agents/runtime/orchestrator.js')
   await Promise.all([deletePod(agentId), deleteChromeProfilePvc(agentId)])
@@ -206,6 +202,17 @@ async function markCompleted(id: string): Promise<void> {
 }
 
 async function markFailed(job: CleanupJob, error: unknown): Promise<void> {
+  if (error instanceof CleanupDeferred) {
+    await pool.query(
+      `UPDATE workspace_cleanup_jobs
+          SET locked_by = NULL, locked_until = NULL,
+              available_at = NOW() + INTERVAL '1 minute',
+              updated_at = NOW()
+        WHERE id = $1 AND locked_by = $2`,
+      [job.id, workerId],
+    )
+    return
+  }
   const message = error instanceof Error ? error.message : String(error)
   const delayMs = Math.min(60 * 60_000, 1_000 * (2 ** Math.min(job.attempts, 12)))
   await pool.query(

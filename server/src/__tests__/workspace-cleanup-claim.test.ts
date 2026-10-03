@@ -27,8 +27,7 @@ test('cleanup claims are capped and message references match the key exactly', a
   }
   const claim = sql.find((statement) => statement.includes('FOR UPDATE SKIP LOCKED'))
   assert.ok(claim, 'drain did not claim a job')
-  assert.match(claim, new RegExp(`attempts < \\$${4}`))
-  assert.match(claim, /cardinality\(agent_ids\) = 0/)
+  assert.match(claim, /attempts < \$4/)
   const messages = sql.find((statement) => statement.includes('FROM messages'))
   assert.ok(messages)
   assert.match(messages, /attachment->>'key' = ANY/)
