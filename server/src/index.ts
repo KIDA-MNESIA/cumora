@@ -269,7 +269,8 @@ async function main() {
 
   // Idle scheduler — gives agents a chance to spontaneously initiate when
   // nothing is incoming. Defaults to 15min cadence; set IDLE_INTERVAL_MS=0
-  // to disable. See agents/idle.ts for what an idle tick actually does.
+  // to disable. Each tick takes an advisory lock, so a second replica does
+  // not run a second agenda classifier and a second agent turn. See agents/idle.ts.
   if (process.env.ENABLE_IDLE !== 'false' && env.IDLE_INTERVAL_MS > 0) {
     const handle = startIdleScheduler(env.IDLE_INTERVAL_MS)
     if (handle) {
