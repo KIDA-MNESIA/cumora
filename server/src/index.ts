@@ -11,7 +11,7 @@ import { api } from './api/router.js'
 import { storage, UPLOAD_DIR } from './storage.js'
 import { attachWebSocket, resetHumanPresenceOnBoot } from './ws.js'
 import { bootDocumentBus } from './documents/rooms.js'
-import { pool } from './db/pool.js'
+import { healthPool, pool } from './db/pool.js'
 import { redis } from './redis.js'
 import { startScanner } from './agents/scanner.js'
 import { startScheduler } from './agents/scheduler.js'
@@ -385,6 +385,7 @@ async function main() {
     stopRealtimeOutboxWorker()
     stopWorkspaceCleanupWorker()
     try { await pool.end() } catch { /* ignore */ }
+    try { await healthPool.end() } catch { /* ignore */ }
     try { redis.disconnect() } catch { /* ignore */ }
     process.exit(0)
   }

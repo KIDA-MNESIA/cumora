@@ -16,7 +16,7 @@ import {
   storage, UPLOAD_DIR, freshenAttachmentUrl, normalizeStorageKey,
   storageKeyFromPublicUrl, messageAttachmentStorageKey,
 } from '../storage.js'
-import { pool } from '../db/pool.js'
+import { healthPool, pool } from '../db/pool.js'
 import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, CH_BOARDS, CH_STATUS, CH_WORKSPACES, publish } from '../redis.js'
 import { enqueueBroadcast, nudgeRealtimeOutbox, withOutboxTransaction } from '../realtime-outbox.js'
 import { enqueueWorkspaceCleanup, nudgeWorkspaceCleanupWorker } from '../workspace-cleanup.js'
@@ -680,7 +680,7 @@ api.get('/livez', (_req, res) => { res.json({ ok: true, ts: Date.now() }) })
 api.get('/health', async (_req, res) => {
   try {
     await Promise.race([
-      pool.query('SELECT 1'),
+      healthPool.query('SELECT 1'),
       new Promise((_, reject) => setTimeout(() => reject(new Error('health db check timed out')), 1000)),
     ])
     res.json({ ok: true, ts: Date.now() })
