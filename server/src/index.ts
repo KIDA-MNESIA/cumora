@@ -25,47 +25,45 @@ import { runtimeRouter } from './agents/runtime/server.js'
 import { startCompletedPodGc, startClusterFuseMonitor, startChromeProfilePvcGc } from './agents/runtime/orchestrator.js'
 import { inboundEmailRouter } from './api/inbound-email.js'
 import { startEmailRetryWorker } from './email-retry.js'
-import { startEmailGcWorker } from './email-gc.js'
-import { startDbGcWorker } from './db-gc.js'
-import { startCalendarScheduler } from './calendar.js'
-import { startPollExpirationSweeper } from './polls.js'
-import { startLlmRollupRefresher } from './agents/llm-rollup.js'
-import { startTrialSweepWorker } from './trial-sweep.js'
+import { startEmailGcWorker, stopEmailGcWorker } from './email-gc.js'
+import { startDbGcWorker, stopDbGcWorker } from './db-gc.js'
+import { startCalendarScheduler, stopCalendarScheduler } from './calendar.js'
+import { startPollExpirationSweeper, stopPollExpirationSweeper } from './polls.js'
+import { startLlmRollupRefresher, stopLlmRollupRefresher } from './agents/llm-rollup.js'
+import { startTrialSweepWorker, stopTrialSweepWorker } from './trial-sweep.js'
 import { seedAdmins } from './admin.js'
 import { notifyAlert } from './alerting.js'
 import { startShippingMaintenance } from './shipping-maintenance.js'
 import { startRealtimeOutboxWorker, stopRealtimeOutboxWorker } from './realtime-outbox.js'
 import { startWorkspaceCleanupWorker, stopWorkspaceCleanupWorker } from './workspace-cleanup.js'
 
+const BOOT_BACKFILL_LOCK_KEY = 7_643_178_926_532n
+
+async function runBootBackfill(): Promise<void> {
+  const client = await pool.connect()
+  try {
+    const lock = await client.query<{ ok: boolean }>(
+      'SELECT pg_try_advisory_lock($1) AS ok', [BOOT_BACKFILL_LOCK_KEY],
+    )
+    if (lock.rows[0]?.ok !== true) return
+    try {
+      await seedIfEmpty()
+      await seedAdmins()
+      await backfillStarterAgents()
+      await backfillHumanGravatars()
+      await backfillStarterAvatars()
+    } finally {
+      await client.query('SELECT pg_advisory_unlock($1)', [BOOT_BACKFILL_LOCK_KEY])
+        .catch(() => { /* session teardown releases it anyway */ })
+    }
+  } finally {
+    client.release()
+  }
+}
+
 async function main() {
   const schemaVersion = await verifySchemaWithBootRetry()
   console.log(`[boot] schema version ${schemaVersion} is compatible`)
-  await seedIfEmpty()
-  // Promote CUMORA_ADMIN_EMAILS members to is_admin on every boot —
-  // idempotent, only flips FALSE→TRUE. Demotion goes through the panel.
-  await seedAdmins()
-  // Catch any company that was created before the auto-onboarding wiring
-  // existed (e.g. dev workspaces predating this commit).
-  await backfillStarterAgents()
-  // Catch human participants who were created before Gravatar wiring.
-  await backfillHumanGravatars()
-  // Stamp default portraits on starter agents seeded before the
-  // pre-baked-avatar wiring shipped. Skips agents that already have
-  // an avatar_url (i.e. ones that have already regenerated their own).
-  await backfillStarterAvatars()
-  // Compute embeddings for any memory rows that don't have one yet
-  // (existing data from before pgvector was wired in, or rows whose
-  // OpenAI call failed at write time). Fire-and-forget — the server
-  // accepts traffic immediately and memory retrieval gracefully
-  // degrades to recency-only on rows still missing an embedding.
-  void backfillMemoryEmbeddings().catch((e) =>
-    console.warn('[embed:backfill] crashed', e instanceof Error ? e.message : String(e)),
-  )
-
-  // Per-turn FS namespaces live under /tmp/cumora-fs/. A clean shutdown
-  // tears them down individually; a crashed prior process may have
-  // leaked some. Wipe and recreate the root once at boot.
-  await sweepStaleNamespaces()
 
   // In local-storage mode the uploads dir backs the /uploads/ static handler
   // below. In R2 mode neither is needed — files live in object storage and
@@ -225,7 +223,7 @@ async function main() {
   })
 
   const server = http.createServer(app)
-  attachWebSocket(server)
+  const wss = attachWebSocket(server)
   // Cross-instance Y.Doc fan-out — the room manager subscribes to the
   // doc redis channels here so two server instances stay convergent.
   bootDocumentBus()
@@ -233,6 +231,20 @@ async function main() {
   server.listen(env.PORT, () => {
     console.log(`[boot] cumora server :${env.PORT} · instance ${env.INSTANCE_ID} · model ${env.OPENAI_MODEL}`)
   })
+
+  // Seed and backfill after listen. They used to run first, so a rollout
+  // could not become ready until every replica had scanned the tables.
+  // One replica takes the lock; the others skip. The filesystem sweep is
+  // per machine and stays outside that lock.
+  void sweepStaleNamespaces().catch((error) => {
+    console.warn('[boot] sweepStaleNamespaces crashed', error instanceof Error ? error.message : error)
+  })
+  void runBootBackfill().catch((error) => {
+    console.warn('[boot] backfill crashed', error instanceof Error ? error.message : error)
+  })
+  void backfillMemoryEmbeddings().catch((e) =>
+    console.warn('[embed:backfill] crashed', e instanceof Error ? e.message : String(e)),
+  )
 
   // Demote any 'avail' humans left over from the previous run; real
   // presence will be re-asserted as WS clients reconnect. Run AFTER
@@ -378,14 +390,30 @@ async function main() {
     console.log('[boot] computer offline sweeper running every 30s')
   }
 
-  // Graceful shutdown
+  // Graceful shutdown. Close sockets with a going-away frame, stop the
+  // workers that keep using the pool, then give Postgres ten seconds.
   const shutdown = async (sig: string) => {
     console.log(`[shutdown] ${sig}`)
-    server.close()
     stopRealtimeOutboxWorker()
     stopWorkspaceCleanupWorker()
-    try { await pool.end() } catch { /* ignore */ }
-    try { await healthPool.end() } catch { /* ignore */ }
+    stopEmailGcWorker()
+    stopDbGcWorker()
+    stopCalendarScheduler()
+    stopPollExpirationSweeper()
+    stopLlmRollupRefresher()
+    stopTrialSweepWorker()
+    for (const socket of wss.clients) {
+      try { socket.close(1001, 'server shutting down') } catch { /* ignore */ }
+    }
+    wss.close()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    await Promise.race([
+      Promise.all([
+        pool.end().catch(() => undefined),
+        healthPool.end().catch(() => undefined),
+      ]),
+      new Promise((resolve) => setTimeout(resolve, 10_000)),
+    ])
     try { redis.disconnect() } catch { /* ignore */ }
     process.exit(0)
   }
